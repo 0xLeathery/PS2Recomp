@@ -527,6 +527,87 @@ namespace
         ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
     }
 
+    std::vector<uint32_t> gMpegManyStreamDataAddrs;
+    std::vector<uint32_t> gMpegManyStreamSps;
+    std::atomic<bool> gMpegManyDemuxed{false};
+    std::atomic<uint32_t> gMpegManyPacketSize{0u};
+
+    constexpr uint32_t kMpegManyNoDataPc = 0x001250C0u;
+    constexpr uint32_t kMpegManyStreamPc = 0x001250D0u;
+    constexpr uint32_t kMpegManyPacketBase = 0x01F84000u;
+    constexpr uint32_t kMpegManyPacketCount = 48u;
+
+    // Writes the packets back to back so a single ring call demuxes all of them.
+    uint32_t writeMpegManyVideoPackets(std::vector<uint8_t> &rdram)
+    {
+        const std::vector<uint8_t> payload = {
+            0x00u, 0x00u, 0x01u, 0xB3u, 0x14u, 0x00u, 0xF0u, 0x13u};
+        const uint16_t packetLen = static_cast<uint16_t>(payload.size() + 3u);
+        std::vector<uint8_t> packet = {
+            0x00u, 0x00u, 0x01u, 0xE0u,
+            static_cast<uint8_t>(packetLen >> 8u),
+            static_cast<uint8_t>(packetLen & 0xFFu),
+            0x80u, 0x00u, 0x00u};
+        packet.insert(packet.end(), payload.begin(), payload.end());
+        const uint32_t packetSize = static_cast<uint32_t>(packet.size());
+        for (uint32_t i = 0u; i < kMpegManyPacketCount; ++i)
+        {
+            std::memcpy(rdram.data() + kMpegManyPacketBase + i * packetSize,
+                        packet.data(), packet.size());
+        }
+        return packetSize;
+    }
+
+    void testMpegManyStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *)
+    {
+        uint32_t dataAddr = 0u;
+        std::memcpy(&dataAddr, rdram + ::getRegU32(ctx, 5) + 0x08u, sizeof(dataAddr));
+        gMpegManyStreamDataAddrs.push_back(dataAddr);
+        gMpegManyStreamSps.push_back(::getRegU32(ctx, 29));
+        ctx->pc = 0u;
+    }
+
+    // Demuxes every packet in one ring call, then supplies a frame once the
+    // stream callbacks have run.
+    void testMpegManyNoData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        const uint32_t mpegAddr = ::getRegU32(ctx, 4);
+        if (gMpegManyDemuxed.exchange(true, std::memory_order_acq_rel))
+        {
+            ps2_stubs::enqueueMpegDecodedFrameForTesting(mpegAddr);
+            setRegU32(*ctx, 2, 1u);
+            ctx->pc = 0u;
+            return;
+        }
+
+        const uint32_t bytes = gMpegManyPacketSize.load(std::memory_order_acquire) * kMpegManyPacketCount;
+        ctx->pc = kMpegManyNoDataPc;
+        setRegU32(*ctx, 4, mpegAddr);
+        setRegU32(*ctx, 5, kMpegManyPacketBase);
+        setRegU32(*ctx, 6, bytes);
+        setRegU32(*ctx, 7, kMpegManyPacketBase);
+        setRegU32(*ctx, 8, bytes);
+        ps2_stubs::sceMpegDemuxPssRing(rdram, ctx, runtime);
+    }
+
+    void prepareMpegManyStreamCallbacks(PS2Runtime &runtime, std::vector<uint8_t> &rdram)
+    {
+        runtime.registerFunction(kMpegManyNoDataPc, testMpegManyNoData);
+        runtime.registerFunction(kMpegManyStreamPc, testMpegManyStreamCallback);
+        gMpegManyStreamDataAddrs.clear();
+        gMpegManyStreamSps.clear();
+        gMpegManyDemuxed.store(false, std::memory_order_release);
+        gMpegManyPacketSize.store(writeMpegManyVideoPackets(rdram), std::memory_order_release);
+
+        R5900Context addCtx{};
+        setRegU32(addCtx, 4, kMpegNoDataHandle);
+        setRegU32(addCtx, 5, 0u);
+        setRegU32(addCtx, 6, 0u);
+        setRegU32(addCtx, 7, kMpegManyStreamPc);
+        setRegU32(addCtx, 8, 0u);
+        ps2_stubs::sceMpegAddStrCallback(rdram.data(), &addCtx, &runtime);
+    }
+
     void testRecordMpegStreamCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         if (!rdram || !ctx)
@@ -1136,6 +1217,36 @@ void register_ps2_runtime_expansion_tests()
             }
             t.Equals(Ps2FastRead32(rdram.data(), kMpegNoDataHandle + 0x00u), 16u,
                      "GetPicture should publish the frame NoData supplied");
+        });
+
+        tc.Run("sceMpegDemuxPssRing runs many NoData stream callbacks on one stack", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            runMpegNoDataScenario(runtime, rdram, 0u, 1u, kMpegManyNoDataPc, [&]()
+            {
+                prepareMpegManyStreamCallbacks(runtime, rdram);
+            });
+
+            t.Equals(gMpegNoDataStage.load(std::memory_order_acquire), 2u,
+                     "GetPicture should return once NoData supplies a frame");
+            t.Equals(static_cast<uint32_t>(gMpegManyStreamDataAddrs.size()), kMpegManyPacketCount,
+                     "one demux should run a stream callback for every video packet");
+            const uint32_t packetSize = gMpegManyPacketSize.load(std::memory_order_acquire);
+            for (uint32_t i = 0u; i < gMpegManyStreamDataAddrs.size(); ++i)
+            {
+                t.Equals(gMpegManyStreamDataAddrs[i], kMpegManyPacketBase + i * packetSize + 9u,
+                         "stream callbacks should run in demux order");
+            }
+            const uint32_t firstSp = gMpegManyStreamSps.empty() ? 0u : gMpegManyStreamSps.front();
+            t.IsTrue(firstSp != 0u, "stream callbacks should get an invocation stack");
+            uint32_t sharedSpCount = 0u;
+            for (const uint32_t sp : gMpegManyStreamSps)
+            {
+                sharedSpCount += sp == firstSp ? 1u : 0u;
+            }
+            t.Equals(sharedSpCount, kMpegManyPacketCount,
+                     "every stream callback from one demux should run on the same stack");
         });
 
         tc.Run("sceMpegDemuxPssRing still queues stream callbacks outside NoData", [](TestCase &t)
